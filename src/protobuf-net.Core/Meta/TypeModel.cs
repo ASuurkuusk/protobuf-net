@@ -1531,6 +1531,7 @@ namespace ProtoBuf.Meta
         /// <returns>The .proto definition as a string</returns>
         public string GetSchema(Type type) => GetSchema(type, ProtoSyntax.Default);
 
+
         /// <summary>
         /// Suggest a .proto definition for the given type
         /// </summary>
@@ -1539,9 +1540,22 @@ namespace ProtoBuf.Meta
         /// <param name="syntax">The .proto syntax to use for the operation</param>
         public virtual string GetSchema(Type type, ProtoSyntax syntax)
         {
+            var exportOptions = new SchemaExportOptions()
+            {
+                Syntax = syntax,
+                Types = type != null ? new Type[] { type } : null,
+            };
+
+            var schemas = GetSchemas(exportOptions);
+            return schemas.Count == 1 ? schemas[0].Schema : "";
+        }
+
+        public virtual IList<ExportedSchema> GetSchemas(SchemaExportOptions schemaOptions)
+        {
             ThrowHelper.ThrowNotSupportedException();
             return default;
         }
+
 
 #pragma warning disable RCS1159 // Use EventHandler<T>.
         /// <summary>

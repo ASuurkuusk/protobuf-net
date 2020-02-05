@@ -30,8 +30,8 @@ namespace ProtoBuf.Meta
                 if (y == null) return 1;
 
                 return string.Compare(
-                    x.GetSchemaTypeName(_callstack),
-                    y.GetSchemaTypeName(_callstack),
+                    x.GetSchemaTypeName(_callstack, null),
+                    y.GetSchemaTypeName(_callstack, null),
                     StringComparison.Ordinal);
             }
         }
@@ -224,7 +224,7 @@ namespace ProtoBuf.Meta
             return this;
         }
 
-        internal string GetSchemaTypeName(HashSet<Type> callstack)
+        internal string GetSchemaTypeName(HashSet<Type> callstack, ProtoImports imports)
         {
             callstack ??= new HashSet<Type>();
             if (!callstack.Add(Type)) return Type.Name; // recursion detected; give up
@@ -233,7 +233,7 @@ namespace ProtoBuf.Meta
             {
                 if (surrogate != null && !callstack.Contains(surrogate))
                 {
-                    return model[surrogate].GetSchemaTypeName(callstack);
+                    return model[surrogate].GetSchemaTypeName(callstack, imports);
                 }
 
                 if (!string.IsNullOrEmpty(name)) return name;
@@ -254,7 +254,7 @@ namespace ProtoBuf.Meta
                         MetaType mt;
                         if (isKnown && (mt = model[tmp]) != null)
                         {
-                            sb.Append(mt.GetSchemaTypeName(callstack));
+                            sb.Append(mt.GetSchemaTypeName(callstack, imports));
                         }
                         else if (tmp.IsArray)
                         {
@@ -266,11 +266,17 @@ namespace ProtoBuf.Meta
                             mt = null;
                             try { mt = model.Add(tmp); }
                             catch { }
-                            if (mt != null) sb.Append(mt.GetSchemaTypeName(callstack));
+                            if (mt != null) sb.Append(mt.GetSchemaTypeName(callstack, imports));
                             else sb.Append(tmp.Name); // give up
                         }
                     }
                     return sb.ToString();
+                }
+
+                var importDefinition = imports?.GetImportDefinition(Type);
+                if (importDefinition != null)
+                {
+                    return $".{importDefinition.Package}.{typeName}";
                 }
 
                 return typeName;
@@ -282,7 +288,7 @@ namespace ProtoBuf.Meta
                     // No need to check for nesting/array rank here. If that's invalid
                     // other parts of the schema generator will throw.
                     MetaType mt;
-                    var name = (model.IsDefined(elementType) && (mt = model[elementType]) != null) ? mt.GetSchemaTypeName(callstack) : elementType.Name;
+                    var name = (model.IsDefined(elementType) && (mt = model[elementType]) != null) ? mt.GetSchemaTypeName(callstack, imports) : elementType.Name;
                     return "Array_" + name;
                 }
             }
@@ -1750,31 +1756,33 @@ namespace ProtoBuf.Meta
             set { SetFlag(OPTIONS_IsGroup, value, true); }
         }
 
-        internal void WriteSchema(HashSet<Type> callstack, StringBuilder builder, int indent, ref RuntimeTypeModel.CommonImports imports, ProtoSyntax syntax)
+        internal void WriteSchema(HashSet<Type> callstack, ProtoBuilder protoBuilder, int indent)
         {
             if (surrogate != null) return; // nothing to write
 
+            var builder = protoBuilder.Body;
+            var imports = protoBuilder.Imports;
+            var syntax = protoBuilder.Syntax;
             var repeated = model.TryGetRepeatedProvider(Type);
 
             if (repeated != null)
-            {
-                
-                NewLine(builder, indent).Append("message ").Append(GetSchemaTypeName(callstack)).Append(" {");
+            {                
+                NewLine(builder, indent).Append("message ").Append(GetSchemaTypeName(callstack, imports)).Append(" {");
 
                 if (repeated.IsValidProtobufMap(model))
                 {
                     repeated.ResolveMapTypes(out var key, out var value);
 
                     NewLine(builder, indent + 1).Append("map<")
-                        .Append(model.GetSchemaTypeName(callstack, key, DataFormat.Default, false, false, ref imports))
+                        .Append(model.GetSchemaTypeName(callstack, key, DataFormat.Default, false, false, imports))
                         .Append(", ")
-                        .Append(model.GetSchemaTypeName(callstack, value, DataFormat.Default, false, false, ref imports))
+                        .Append(model.GetSchemaTypeName(callstack, value, DataFormat.Default, false, false, imports))
                         .Append("> items = 1;");
                 }
                 else
                 {
                     NewLine(builder, indent + 1).Append("repeated ")
-                        .Append(model.GetSchemaTypeName(callstack, repeated.ItemType, DataFormat.Default, false, false, ref imports))
+                        .Append(model.GetSchemaTypeName(callstack, repeated.ItemType, DataFormat.Default, false, false, imports))
                         .Append(" items = 1;");
                 }
                 NewLine(builder, indent).Append('}');
@@ -1783,7 +1791,7 @@ namespace ProtoBuf.Meta
             { // key-value-pair etc
                 if (ResolveTupleConstructor(Type, out MemberInfo[] mapping) != null)
                 {
-                    NewLine(builder, indent).Append("message ").Append(GetSchemaTypeName(callstack)).Append(" {");
+                    NewLine(builder, indent).Append("message ").Append(GetSchemaTypeName(callstack, imports)).Append(" {");
                     for (int i = 0; i < mapping.Length; i++)
                     {
                         Type effectiveType;
@@ -1799,7 +1807,7 @@ namespace ProtoBuf.Meta
                         {
                             throw new NotSupportedException("Unknown member type: " + mapping[i].GetType().Name);
                         }
-                        NewLine(builder, indent + 1).Append(syntax == ProtoSyntax.Proto2 ? "optional " : "").Append(model.GetSchemaTypeName(callstack, effectiveType, DataFormat.Default, false, false, ref imports).Replace('.', '_'))
+                        NewLine(builder, indent + 1).Append(syntax == ProtoSyntax.Proto2 ? "optional " : "").Append(model.GetSchemaTypeName(callstack, effectiveType, DataFormat.Default, false, false, imports).Replace('.', '_'))
                             .Append(' ').Append(mapping[i].Name).Append(" = ").Append(i + 1).Append(';');
                     }
                     NewLine(builder, indent).Append('}');
@@ -1812,7 +1820,7 @@ namespace ProtoBuf.Meta
 
                 bool allValid = IsValidEnum(enums);
                 if (!allValid) NewLine(builder, indent).Append("/* for context only");
-                NewLine(builder, indent).Append("enum ").Append(GetSchemaTypeName(callstack)).Append(" {");
+                NewLine(builder, indent).Append("enum ").Append(GetSchemaTypeName(callstack, imports)).Append(" {");
 
                 if (Type.IsDefined(typeof(FlagsAttribute), true))
                 {
@@ -1874,7 +1882,7 @@ namespace ProtoBuf.Meta
             else
             {
                 ValueMember[] fieldsArr = GetFields();
-                NewLine(builder, indent).Append("message ").Append(GetSchemaTypeName(callstack)).Append(" {");
+                NewLine(builder, indent).Append("message ").Append(GetSchemaTypeName(callstack, imports)).Append(" {");
                 foreach (ValueMember member in fieldsArr)
                 {
                     string schemaTypeName;
@@ -1884,8 +1892,8 @@ namespace ProtoBuf.Meta
                         repeated = model.TryGetRepeatedProvider(member.MemberType);
                         repeated.ResolveMapTypes(out var keyType, out var valueType);
 
-                        var keyTypeName = model.GetSchemaTypeName(callstack, keyType, member.MapKeyFormat, false, false, ref imports);
-                        schemaTypeName = model.GetSchemaTypeName(callstack, valueType, member.MapKeyFormat, member.AsReference, member.DynamicType, ref imports);
+                        var keyTypeName = model.GetSchemaTypeName(callstack, keyType, member.MapKeyFormat, false, false, imports);
+                        schemaTypeName = model.GetSchemaTypeName(callstack, valueType, member.MapKeyFormat, member.AsReference, member.DynamicType, imports);
                         NewLine(builder, indent + 1).Append("map<").Append(keyTypeName).Append(",").Append(schemaTypeName).Append("> ")
                             .Append(member.Name).Append(" = ").Append(member.FieldNumber).Append(";");
                     }
@@ -1895,7 +1903,7 @@ namespace ProtoBuf.Meta
                         NewLine(builder, indent + 1).Append(ordinality);
                         if (member.DataFormat == DataFormat.Group) builder.Append("group ");
 
-                        schemaTypeName = member.GetSchemaTypeName(callstack, true, ref imports, out var altName);
+                        schemaTypeName = member.GetSchemaTypeName(callstack, true, imports, out var altName);
                         builder.Append(schemaTypeName).Append(" ")
                              .Append(member.Name).Append(" = ").Append(member.FieldNumber);
 
@@ -1931,12 +1939,12 @@ namespace ProtoBuf.Meta
                         }
                         if (member.AsReference)
                         {
-                            imports |= RuntimeTypeModel.CommonImports.Protogen;
+                            imports.CommonImports |= RuntimeTypeModel.CommonImports.Protogen;
                             AddOption(builder, ref hasOption).Append("(.protobuf_net.fieldopt).asRef = true");
                         }
                         if (member.DynamicType)
                         {
-                            imports |= RuntimeTypeModel.CommonImports.Protogen;
+                            imports.CommonImports |= RuntimeTypeModel.CommonImports.Protogen;
                             AddOption(builder, ref hasOption).Append("(.protobuf_net.fieldopt).dynamicType = true");
                         }
                         CloseOption(builder, ref hasOption).Append(';');
@@ -1957,7 +1965,7 @@ namespace ProtoBuf.Meta
                     }
                     if (schemaTypeName == ".bcl.NetObjectProxy" && member.AsReference && !member.DynamicType) // we know what it is; tell the user
                     {
-                        builder.Append(" // reference-tracked ").Append(member.GetSchemaTypeName(callstack, false, ref imports, out _));
+                        builder.Append(" // reference-tracked ").Append(member.GetSchemaTypeName(callstack, false, imports, out _));
                     }
                 }
                 if (_subTypes != null && _subTypes.Count != 0)
@@ -1966,7 +1974,7 @@ namespace ProtoBuf.Meta
                     Array.Sort(subTypeArr, SubType.Comparer.Default);
                     string[] fieldNames = new string[subTypeArr.Length];
                     for(int i = 0; i < subTypeArr.Length;i++)
-                        fieldNames[i] = subTypeArr[i].DerivedType.GetSchemaTypeName(callstack);
+                        fieldNames[i] = subTypeArr[i].DerivedType.GetSchemaTypeName(callstack, imports);
 
                     string fieldName = "subtype";
                     while (Array.IndexOf(fieldNames, fieldName) >= 0)
@@ -1976,8 +1984,16 @@ namespace ProtoBuf.Meta
                     for(int i = 0; i < subTypeArr.Length; i++)
                     {
                         var subTypeName = fieldNames[i];
+                        var subFieldName = subTypeName;
+                        // Fully qualified type names using '.' notation will not 
+                        // work well as a field name. Let's remove the first '.' 
+                        // and replace the rest with '_'.
+                        if( subFieldName.StartsWith("."))
+                        {
+                            subFieldName = subFieldName.Substring(1).Replace('.', '_');
+                        }
                         NewLine(builder, indent + 2).Append(subTypeName)
-                               .Append(" ").Append(subTypeName).Append(" = ").Append(subTypeArr[i].FieldNumber).Append(';');
+                               .Append(" ").Append(subFieldName).Append(" = ").Append(subTypeArr[i].FieldNumber).Append(';');
                     }
                     NewLine(builder, indent + 1).Append("}");
                 }

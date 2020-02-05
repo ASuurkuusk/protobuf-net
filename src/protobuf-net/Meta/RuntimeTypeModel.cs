@@ -172,95 +172,99 @@ namespace ProtoBuf.Meta
         /// </summary>
         public IEnumerable GetTypes() => types;
 
-        /// <summary>
-        /// Suggest a .proto definition for the given type
-        /// </summary>
-        /// <param name="type">The type to generate a .proto definition for, or <c>null</c> to generate a .proto that represents the entire model</param>
-        /// <returns>The .proto definition as a string</returns>
-        /// <param name="syntax">The .proto syntax to use</param>
-        public override string GetSchema(Type type, ProtoSyntax syntax)
+        public override IList<ExportedSchema> GetSchemas(SchemaExportOptions schemaOptions)
         {
-            syntax = Serializer.GlobalOptions.Normalize(syntax);
+            var syntax = Serializer.GlobalOptions.Normalize(schemaOptions.Syntax);
+            var protoBuilders = new Dictionary<ProtoDefinition, ProtoBuilder>();
+
             var requiredTypes = new List<MetaType>();
+
+            // Special handling for a single type
             MetaType primaryType = null;
-            bool isInbuiltType = false;
-            if (type == null)
-            { // generate for the entire model
+            List<Type> inbuiltTypes = new List<Type>();
+
+            if (schemaOptions.Types == null )
+            {
+                // generate for the entire model
                 foreach (MetaType meta in types)
                 {
-                    MetaType tmp = meta.GetSurrogateOrBaseOrSelf(false);
-                    if (!requiredTypes.Contains(tmp))
-                    { // ^^^ note that the type might have been added as a descendent
-                        requiredTypes.Add(tmp);
-                        CascadeDependents(requiredTypes, tmp);
-                    }
+                    IncludeMetaType(meta);
                 }
             }
             else
             {
-                Type tmp = Nullable.GetUnderlyingType(type);
-                if (tmp != null) type = tmp;
-
-                isInbuiltType = (ValueMember.TryGetCoreSerializer(this, DataFormat.Default, type, out var _, false, false, false, false) != null);
-                if (!isInbuiltType)
+                // Generate for specified types, with special handling of a built in types.
+                foreach (var type in schemaOptions.Types)
                 {
-                    //Agenerate just relative to the supplied type
-                    int index = FindOrAddAuto(type, false, false, false);
-                    if (index < 0) throw new ArgumentException("The type specified is not a contract-type", nameof(type));
-
-                    // get the required types
-                    primaryType = ((MetaType)types[index]).GetSurrogateOrBaseOrSelf(false);
-                    requiredTypes.Add(primaryType);
-                    CascadeDependents(requiredTypes, primaryType);
+                    var (metaType,actualType) = IncludeType(type);
+                    if (metaType != null)
+                    {
+                        primaryType = metaType;
+                    }
+                    else
+                    {
+                        inbuiltTypes.Add(actualType);
+                    }
                 }
             }
 
-            // use the provided type's namespace for the "package"
-            StringBuilder headerBuilder = new StringBuilder();
-            string package = null;
-
-            if (!isInbuiltType)
+            // Include service types (if available)
+            if (schemaOptions.Services != null)
             {
-                IEnumerable<MetaType> typesForNamespace = primaryType == null ? types.Cast<MetaType>() : requiredTypes;
-                foreach (MetaType meta in typesForNamespace)
+                foreach (var serviceDef in schemaOptions.Services)
                 {
-                    if (TryGetRepeatedProvider(meta.Type) != null) continue;
-
-                    string tmp = meta.Type.Namespace;
-                    if (!string.IsNullOrEmpty(tmp))
+                    foreach( var op in serviceDef.Operations)
                     {
-                        if (tmp.StartsWith("System.")) continue;
-                        if (package == null)
-                        { // haven't seen any suggestions yet
-                            package = tmp;
+                        if( op.RequestType != null )
+                        {
+                            IncludeType(op.RequestType);
                         }
-                        else if (package == tmp)
-                        { // that's fine; a repeat of the one we already saw
-                        }
-                        else
-                        { // something else; have confliucting suggestions; abort
-                            package = null;
-                            break;
+                        if( op.ResponseType != null )
+                        {
+                            IncludeType(op.ResponseType);
                         }
                     }
                 }
             }
-            switch (syntax)
+
+            // use the provided type's namespace for the "package"
+            string package = schemaOptions.DefaultPackage;
+
+            if (string.IsNullOrEmpty(package) /*or just: package == null */)
             {
-                case ProtoSyntax.Proto2:
-                    headerBuilder.AppendLine(@"syntax = ""proto2"";");
-                    break;
-                case ProtoSyntax.Proto3:
-                    headerBuilder.AppendLine(@"syntax = ""proto3"";");
-                    break;
-                default:
-                    throw new ArgumentOutOfRangeException(nameof(syntax));
+                // Use heurstics to find a default package name. 
+                // It should probably be recommended to always specify
+                // a name (should an empty package name mean no package lookup?)
+                IEnumerable<MetaType> typesForNamespace = schemaOptions.Types == null ? types.Cast<MetaType>() : requiredTypes;
+                foreach (MetaType meta in typesForNamespace)
+                {
+                    if (TryGetRepeatedProvider(meta.Type) != null) continue;
+                    var protoDefinition = schemaOptions.TypeMapper?.Invoke(meta.Type);
+
+                    if (protoDefinition == null || protoDefinition.IsDefault )
+                    {
+                        string tmp = protoDefinition != null ? protoDefinition.Package : meta.Type.Namespace;
+                        if (!string.IsNullOrEmpty(tmp))
+                        {
+                            if (tmp.StartsWith("System.")) continue;
+                            if (package == null)
+                            { // haven't seen any suggestions yet
+                                package = tmp;
+                            }
+                            else if (package == tmp)
+                            { // that's fine; a repeat of the one we already saw
+                            }
+                            else
+                            { // something else; have confliucting suggestions; abort
+                                package = null;
+                                break;
+                            }
+                        }
+                    }
+                }
             }
 
-            if (!string.IsNullOrEmpty(package))
-            {
-                headerBuilder.Append("package ").Append(package).Append(';').AppendLine();
-            }
+            var defaultProtoDefinition = new ProtoDefinition(schemaOptions.DefaultProtoFile ?? "", package);
 
             // check for validity
             foreach (var mt in requiredTypes)
@@ -268,8 +272,6 @@ namespace ProtoBuf.Meta
                 _ = mt.Serializer; // force errors to happen if there's problems
             }
 
-            var imports = CommonImports.None;
-            StringBuilder bodyBuilder = new StringBuilder();
             // sort them by schema-name
             var callstack = new HashSet<Type>(); // for recursion detection
             MetaType[] metaTypesArr = new MetaType[requiredTypes.Count];
@@ -277,40 +279,123 @@ namespace ProtoBuf.Meta
             Array.Sort(metaTypesArr, new MetaType.Comparer(callstack));
 
             // write the messages
-            if (isInbuiltType)
+            foreach( var inbuiltType in inbuiltTypes )
             {
-                bodyBuilder.AppendLine().Append("message ").Append(type.Name).Append(" {");
-                MetaType.NewLine(bodyBuilder, 1).Append(syntax == ProtoSyntax.Proto2 ? "optional " : "").Append(GetSchemaTypeName(callstack, type, DataFormat.Default, false, false, ref imports))
+                var protoDefinition = schemaOptions.TypeMapper?.Invoke(inbuiltType) ?? defaultProtoDefinition;
+                var protoBuilder = CreateProtoBuilder(defaultProtoDefinition);
+
+                var bodyBuilder = protoBuilder.Body;
+                bodyBuilder.AppendLine().Append("message ").Append(inbuiltType.Name).Append(" {");
+                MetaType.NewLine(bodyBuilder, 1).Append(syntax == ProtoSyntax.Proto2 ? "optional " : "").Append(GetSchemaTypeName(callstack, inbuiltType, DataFormat.Default, false, false, protoBuilder.Imports))
                     .Append(" value = 1;").AppendLine().Append('}');
             }
-            else
+
+            for (int i = 0; i < metaTypesArr.Length; i++)
             {
-                for (int i = 0; i < metaTypesArr.Length; i++)
+                MetaType tmp = metaTypesArr[i];
+                if (tmp.SerializerType is object) continue; // not our concern
+                if (tmp != primaryType && TryGetRepeatedProvider(tmp.Type) != null) continue;
+
+                var protoDefinition = schemaOptions.TypeMapper?.Invoke(tmp.Type) ?? defaultProtoDefinition;
+                if (!protoDefinition.IsExternal)
                 {
-                    MetaType tmp = metaTypesArr[i];
-                    if (tmp.SerializerType is object) continue; // not our concern
-                    if (tmp != primaryType && TryGetRepeatedProvider(tmp.Type) != null) continue;
-                    tmp.WriteSchema(callstack, bodyBuilder, 0, ref imports, syntax);
+                    var protoBuilder = CreateProtoBuilder(protoDefinition);
+
+                    tmp.WriteSchema(callstack, protoBuilder, 0);
                 }
             }
-            if ((imports & CommonImports.Bcl) != 0)
+
+            // Write the services
+            if (schemaOptions.Services != null)
             {
-                headerBuilder.Append("import \"protobuf-net/bcl.proto\"; // schema for protobuf-net's handling of core .NET types").AppendLine();
+                foreach (var serviceDef in schemaOptions.Services)
+                {
+                    var protoBuilder = CreateProtoBuilder(serviceDef.Proto ?? defaultProtoDefinition);
+
+                    var builder = protoBuilder.Body;
+
+                    builder.AppendLine();
+                    builder.Append($"service {serviceDef.Name} {{");
+
+                    foreach (var opDef in serviceDef.Operations )
+                    {
+                        var requestMetaType = GetMetaType(opDef.RequestType);
+                        string requestName = requestMetaType.GetSchemaTypeName(callstack, protoBuilder.Imports);
+                        
+                        var responseMetaType = GetMetaType(opDef.ResponseType);
+                        string responseName = responseMetaType.GetSchemaTypeName(callstack, protoBuilder.Imports);
+
+                        MetaType.NewLine(builder, 1).Append(
+                            $"rpc {opDef.Name} ({requestName}) returns ({responseName});");
+                    }
+
+                    MetaType.NewLine(builder, 0).Append("}");
+                }
             }
-            if ((imports & CommonImports.Protogen) != 0)
+
+            var generatedSchemas = new List<ExportedSchema>();
+
+            foreach( var protoBuilder in protoBuilders.Values)
             {
-                headerBuilder.Append("import \"protobuf-net/protogen.proto\"; // custom protobuf-net options").AppendLine();
+                var definition = protoBuilder.ProtoDefinition;
+
+                protoBuilder.ApplyImports();
+
+                generatedSchemas.Add(new ExportedSchema( definition.ProtoFile, protoBuilder.GetSchema()) );
             }
-            if ((imports & CommonImports.Timestamp) != 0)
+
+            return generatedSchemas;
+           
+            //--- Helper methods
+            ProtoBuilder CreateProtoBuilder(ProtoDefinition protoDefinition)
             {
-                headerBuilder.Append("import \"google/protobuf/timestamp.proto\";").AppendLine();
+                if (!protoBuilders.TryGetValue(protoDefinition, out var builder))
+                {
+                    builder = new ProtoBuilder(protoDefinition, syntax, schemaOptions.TypeMapper);
+                    protoBuilders.Add(protoDefinition, builder);
+                }
+
+                return builder;
             }
-            if ((imports & CommonImports.Duration) != 0)
+
+            (MetaType,Type) IncludeType( Type type )
             {
-                headerBuilder.Append("import \"google/protobuf/duration.proto\";").AppendLine();
+                var actualType = type;
+                Type tmp = Nullable.GetUnderlyingType(actualType);
+                if (tmp != null) actualType = tmp;
+
+                bool isInbuiltType = (ValueMember.TryGetCoreSerializer(this, DataFormat.Default, actualType, out var _, false, false, false, false) != null);
+                if (!isInbuiltType)
+                {
+                    //Agenerate just relative to the supplied type
+                    var metaType = GetMetaType(actualType);
+                    IncludeMetaType(metaType);
+                    return (metaType, actualType);
+                }
+
+                return (null,actualType);
             }
-            return headerBuilder.Append(bodyBuilder).AppendLine().ToString();
+
+            void IncludeMetaType(MetaType metaType)
+            {
+                MetaType tmp = metaType.GetSurrogateOrBaseOrSelf(false);
+                if (!requiredTypes.Contains(tmp))
+                { // ^^^ note that the type might have been added as a descendent
+                    requiredTypes.Add(tmp);
+                    CascadeDependents(requiredTypes, tmp);
+                }
+            }
+
+            MetaType GetMetaType(Type type)
+            {
+                int index = FindOrAddAuto(type, false, false, false);
+                if (index < 0) throw new ArgumentException("The type specified is not a contract-type", nameof(type));
+
+                // get the required types
+                return (MetaType)types[index];
+            }
         }
+
 
         [Flags]
         internal enum CommonImports
@@ -1606,9 +1691,9 @@ namespace ProtoBuf.Meta
         public event LockContentedEventHandler LockContended;
 #pragma warning restore RCS1159 // Use EventHandler<T>.
 
-        internal string GetSchemaTypeName(HashSet<Type> callstack, Type effectiveType, DataFormat dataFormat, bool asReference, bool dynamicType, ref CommonImports imports)
-            => GetSchemaTypeName(callstack, effectiveType, dataFormat, asReference, dynamicType, ref imports, out _);
-        internal string GetSchemaTypeName(HashSet<Type> callstack, Type effectiveType, DataFormat dataFormat, bool asReference, bool dynamicType, ref CommonImports imports, out string altName)
+        internal string GetSchemaTypeName(HashSet<Type> callstack, Type effectiveType, DataFormat dataFormat, bool asReference, bool dynamicType, ProtoImports imports)
+            => GetSchemaTypeName(callstack, effectiveType, dataFormat, asReference, dynamicType, imports, out _);
+        internal string GetSchemaTypeName(HashSet<Type> callstack, Type effectiveType, DataFormat dataFormat, bool asReference, bool dynamicType, ProtoImports imports, out string altName)
         {
             altName = null;
             effectiveType = DynamicStub.GetEffectiveType(effectiveType);
@@ -1620,17 +1705,17 @@ namespace ProtoBuf.Meta
             {   // model type
                 if (asReference || dynamicType)
                 {
-                    imports |= CommonImports.Bcl;
+                    imports.CommonImports |= CommonImports.Bcl;
                     return ".bcl.NetObjectProxy";
                 }
 
                 var mt = this[effectiveType];
 
-                var actual = mt.GetSurrogateOrBaseOrSelf(true).GetSchemaTypeName(callstack);
+                var actual = mt.GetSurrogateOrBaseOrSelf(true).GetSchemaTypeName(callstack, imports);
                 if (mt.Type.IsEnum && !mt.IsValidEnum())
                 {
                     altName = actual;
-                    actual = GetSchemaTypeName(callstack, Enum.GetUnderlyingType(mt.Type), dataFormat, asReference, dynamicType, ref imports);
+                    actual = GetSchemaTypeName(callstack, Enum.GetUnderlyingType(mt.Type), dataFormat, asReference, dynamicType, imports);
                 }
                 return actual;
             }
@@ -1638,7 +1723,7 @@ namespace ProtoBuf.Meta
             {
                 if (ser is ParseableSerializer)
                 {
-                    if (asReference) imports |= CommonImports.Bcl;
+                    if (asReference) imports.CommonImports |= CommonImports.Bcl;
                     return asReference ? ".bcl.NetObjectProxy" : "string";
                 }
 
@@ -1648,7 +1733,7 @@ namespace ProtoBuf.Meta
                     case ProtoTypeCode.Single: return "float";
                     case ProtoTypeCode.Double: return "double";
                     case ProtoTypeCode.String:
-                        if (asReference) imports |= CommonImports.Bcl;
+                        if (asReference) imports.CommonImports |= CommonImports.Bcl;
                         return asReference ? ".bcl.NetObjectProxy" : "string";
                     case ProtoTypeCode.Byte:
                     case ProtoTypeCode.Char:
@@ -1686,10 +1771,10 @@ namespace ProtoBuf.Meta
                         {
                             case DataFormat.FixedSize: return "sint64";
                             case DataFormat.WellKnown:
-                                imports |= CommonImports.Timestamp;
+                                imports.CommonImports |= CommonImports.Timestamp;
                                 return ".google.protobuf.Timestamp";
                             default:
-                                imports |= CommonImports.Bcl;
+                                imports.CommonImports |= CommonImports.Bcl;
                                 return ".bcl.DateTime";
                         }
                     case ProtoTypeCode.TimeSpan:
@@ -1697,14 +1782,14 @@ namespace ProtoBuf.Meta
                         {
                             case DataFormat.FixedSize: return "sint64";
                             case DataFormat.WellKnown:
-                                imports |= CommonImports.Duration;
+                                imports.CommonImports |= CommonImports.Duration;
                                 return ".google.protobuf.Duration";
                             default:
-                                imports |= CommonImports.Bcl;
+                                imports.CommonImports |= CommonImports.Bcl;
                                 return ".bcl.TimeSpan";
                         }
-                    case ProtoTypeCode.Decimal: imports |= CommonImports.Bcl; return ".bcl.Decimal";
-                    case ProtoTypeCode.Guid: imports |= CommonImports.Bcl; return ".bcl.Guid";
+                    case ProtoTypeCode.Decimal: imports.CommonImports |= CommonImports.Bcl; return ".bcl.Decimal";
+                    case ProtoTypeCode.Guid: imports.CommonImports |= CommonImports.Bcl; return ".bcl.Guid";
                     case ProtoTypeCode.Type: return "string";
                     default: throw new NotSupportedException("No .proto map found for: " + effectiveType.FullName);
                 }
